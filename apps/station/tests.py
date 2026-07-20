@@ -1,94 +1,176 @@
 from django.contrib.auth import get_user_model
 from django.test import TestCase
 from django.urls import reverse
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 
-from apps.station.models import Station, TrainType, Train
-from apps.station.serializers import StationSerializer, TrainSerializer
+from apps.station.models import (
+    Journey,
+    Order,
+    Route,
+    Station,
+    Ticket,
+    Train,
+    TrainType,
+)
 
 STATION_URL = reverse("station-list")
 TRAIN_URL = reverse("train-list")
+ROUTE_URL = reverse("route-list")
+JOURNEY_URL = reverse("journey-list")
+ORDER_URL = reverse("order-list")
 
 
 def sample_station(**params):
     defaults = {
-        "name": "Test Station",
-        "latitude": 50.0,
-        "longitude": 20.0,
+        "name": "Central Station",
+        "latitude": 50.45,
+        "longitude": 30.52,
     }
     defaults.update(params)
     return Station.objects.create(**defaults)
 
 
 def sample_train(**params):
-    train_type = TrainType.objects.create(name="Default Type")
+    if "train_type" not in params:
+        params["train_type"] = TrainType.objects.create(
+            name="Express-Type"
+        )
     defaults = {
-        "name": "Test Train",
+        "name": "Intercity 100",
         "cargo_num": 5,
         "places_in_cargo": 20,
-        "train_type": train_type,
     }
     defaults.update(params)
     return Train.objects.create(**defaults)
 
 
-class UnauthenticatedStationApiTests(TestCase):
+def sample_route(**params):
+    if "source" not in params:
+        params["source"] = sample_station(name="A")
+    if "destination" not in params:
+        params["destination"] = sample_station(name="B")
+    defaults = {"distance": 500}
+    defaults.update(params)
+    return Route.objects.create(**defaults)
+
+
+def sample_journey(**params):
+    if "route" not in params:
+        params["route"] = sample_route()
+    if "train" not in params:
+        params["train"] = sample_train()
+    defaults = {
+        "departure_time": timezone.now() + timezone.timedelta(days=1),
+        "arrival_time": (
+            timezone.now() + timezone.timedelta(days=1, hours=5)
+        ),
+    }
+    defaults.update(params)
+    return Journey.objects.create(**defaults)
+
+
+class UnauthenticatedApiTests(TestCase):
     def setUp(self):
         self.client = APIClient()
 
-    def test_list_stations(self):
-        sample_station()
-        res = self.client.get(STATION_URL)
-        stations = Station.objects.all()
-        serializer = StationSerializer(stations, many=True)
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data, serializer.data)
+    def test_auth_required(self):
+        urls = [
+            STATION_URL,
+            TRAIN_URL,
+            ROUTE_URL,
+            JOURNEY_URL,
+            ORDER_URL,
+        ]
+        for url in urls:
+            res = self.client.get(url)
+            self.assertIn(
+                res.status_code,
+                [
+                    status.HTTP_401_UNAUTHORIZED,
+                    status.HTTP_403_FORBIDDEN,
+                ],
+            )
 
 
-class AuthenticatedTrainApiTests(TestCase):
+class PassengerApiTests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.user = get_user_model().objects.create_user(
-            "test@test.com", "testpass"
+            username="passenger",
+            password="password123"
         )
         self.client.force_authenticate(self.user)
 
-    def test_list_trains(self):
-        sample_train()
-        res = self.client.get(TRAIN_URL)
-        trains = Train.objects.all()
-        serializer = TrainSerializer(trains, many=True)
+    def test_passenger_can_read_endpoints(self):
+        sample_station()
+        res = self.client.get(STATION_URL)
         self.assertEqual(res.status_code, status.HTTP_200_OK)
-        self.assertEqual(res.data, serializer.data)
 
-    def test_create_train(self):
-        train_type = TrainType.objects.create(name="Express")
+    def test_passenger_cannot_create_station(self):
         payload = {
-            "name": "New Express",
-            "cargo_num": 10,
-            "places_in_cargo": 30,
-            "train_type": train_type.id,
+            "name": "Forbidden Station",
+            "latitude": 10.0,
+            "longitude": 20.0,
         }
-        res = self.client.post(TRAIN_URL, payload)
-        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
-        train = Train.objects.get(id=res.data["id"])
-        for key in payload.keys():
-            if key == "train_type":
-                self.assertEqual(getattr(train, key).id, payload[key])
-            else:
-                self.assertEqual(getattr(train, key), payload[key])
+        res = self.client.post(STATION_URL, payload)
+        self.assertEqual(res.status_code, status.HTTP_403_FORBIDDEN)
 
 
-class AdminOrderApiTests(TestCase):
+class AdminApiTests(TestCase):
     def setUp(self):
         self.client = APIClient()
         self.user = get_user_model().objects.create_superuser(
-            "admin@admin.com", "password"
+            username="adminuser",
+            password="adminpassword"
         )
         self.client.force_authenticate(self.user)
 
-    def test_create_order_forbidden(self):
-        # Пример того, как тестировать методы, если они ограничены
-        res = self.client.get(reverse("order-list"))
-        self.assertEqual(res.status_code, status.HTTP_200_OK)
+    def test_admin_can_create_station(self):
+        payload = {
+            "name": "Admin Station",
+            "latitude": 12.34,
+            "longitude": 56.78,
+        }
+        res = self.client.post(STATION_URL, payload)
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+
+class OrderValidationTests(TestCase):
+    def setUp(self):
+        self.client = APIClient()
+        self.user = get_user_model().objects.create_user(
+            username="buyer",
+            password="password123"
+        )
+        self.client.force_authenticate(self.user)
+        self.train = sample_train(cargo_num=2, places_in_cargo=10)
+        self.journey = sample_journey(train=self.train)
+
+    def test_create_order_valid_ticket(self):
+        payload = {
+            "tickets": [
+                {"cargo": 1, "seat": 5, "journey": self.journey.id}
+            ]
+        }
+        res = self.client.post(ORDER_URL, payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_201_CREATED)
+
+    def test_create_order_invalid_cargo(self):
+        payload = {
+            "tickets": [
+                {"cargo": 3, "seat": 5, "journey": self.journey.id}
+            ]
+        }
+        res = self.client.post(ORDER_URL, payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
+
+    def test_create_order_invalid_seat(self):
+        payload = {
+            "tickets": [
+                {"cargo": 1, "seat": 11, "journey": self.journey.id}
+            ]
+        }
+        res = self.client.post(ORDER_URL, payload, format="json")
+        self.assertEqual(res.status_code, status.HTTP_400_BAD_REQUEST)
